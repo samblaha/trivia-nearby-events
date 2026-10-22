@@ -243,6 +243,9 @@ def _parse_start_hint(event: dict[str, Any], now: datetime) -> datetime | None:
     if "," in raw and len(raw.split(",")[0]) <= 3:
         raw = raw.split(",", 1)[1].strip()
 
+    # Compare as naive UTC-ish wall times — Google labels have no offset.
+    now_naive = now.replace(tzinfo=None)
+
     formats = (
         "%b %d, %Y, %I:%M %p",
         "%b %d, %Y %I:%M %p",
@@ -257,15 +260,15 @@ def _parse_start_hint(event: dict[str, Any], now: datetime) -> datetime | None:
         except ValueError:
             continue
         if "%Y" not in fmt:
-            parsed = parsed.replace(year=now.year)
+            parsed = parsed.replace(year=now_naive.year)
             # Stale undated rows (Jul/Sep in October) should drop, not roll a year.
-            if parsed < now - timedelta(days=2):
-                bumped = parsed.replace(year=now.year + 1)
-                if bumped - now <= timedelta(days=120):
+            if parsed < now_naive - timedelta(days=2):
+                bumped = parsed.replace(year=now_naive.year + 1)
+                if bumped - now_naive <= timedelta(days=120):
                     parsed = bumped
                 else:
                     return parsed  # keep as past → filtered
-        return parsed.replace(tzinfo=timezone.utc)
+        return parsed
     return None
 
 
@@ -273,7 +276,8 @@ def _is_clearly_past(event: dict[str, Any], now: datetime) -> bool:
     parsed = _parse_start_hint(event, now)
     if parsed is None:
         return False
-    return parsed < now - timedelta(hours=3)
+    now_naive = now.replace(tzinfo=None)
+    return parsed < now_naive - timedelta(hours=3)
 
 
 def _fetch_query(
