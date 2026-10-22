@@ -17,9 +17,11 @@ import hashlib
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -35,6 +37,27 @@ NON_TRIVIA_HINTS = re.compile(
     re.I,
 )
 
+# Suburb / neighborhood searches often return stale Google Events rows.
+# Always also query the parent metro so the feed stays dense.
+METRO_FALLBACKS: dict[str, str] = {
+    "westerville": "Columbus, OH",
+    "dublin": "Columbus, OH",
+    "hilliard": "Columbus, OH",
+    "grove city": "Columbus, OH",
+    "gahanna": "Columbus, OH",
+    "reynoldsburg": "Columbus, OH",
+    "upper arlington": "Columbus, OH",
+    "worthington": "Columbus, OH",
+    "new albany": "Columbus, OH",
+    "powell": "Columbus, OH",
+    "pickerington": "Columbus, OH",
+    "canal winchester": "Columbus, OH",
+    "bexley": "Columbus, OH",
+    "grandview": "Columbus, OH",
+    "short north": "Columbus, OH",
+    "german village": "Columbus, OH",
+}
+
 
 def _api_key() -> str:
     key = os.environ.get("SERPAPI_API_KEY", "").strip()
@@ -43,14 +66,33 @@ def _api_key() -> str:
     return key
 
 
-def _http_get(params: dict[str, str]) -> dict[str, Any]:
+def _http_get(params: dict[str, str], *, retries: int = 2) -> dict[str, Any]:
     query = urllib.parse.urlencode(params)
-    req = urllib.request.Request(
-        f"{SERPAPI_SEARCH}?{query}",
-        headers={"User-Agent": "TriviaNearbyEventsAPI/1.0"},
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    url = f"{SERPAPI_SEARCH}?{query}"
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "TriviaNearbyEventsAPI/1.1"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            # Retry rate limits / transient upstream failures.
+            if exc.code in {429, 500, 502, 503, 504} and attempt < retries:
+                time.sleep(0.6 * (attempt + 1))
+                last_error = RuntimeError(f"HTTP {exc.code}: {body[:240]}")
+                continue
+            raise RuntimeError(f"HTTP {exc.code}: {body[:240]}") from exc
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt < retries:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError(str(last_error) if last_error else "request failed")
 
 
 def _stable_id(*parts: str) -> str:
@@ -64,8 +106,6 @@ def _is_trivia_event(event: dict[str, Any]) -> bool:
     blob = f"{title} {etype}"
     if not TRIVIA_RE.search(blob):
         return False
-    # Keep music trivia / themed trivia; drop obvious non-trivia noise
-    # when "trivia" is absent from title but present only weakly — already required.
     if NON_TRIVIA_HINTS.search(title) and not TRIVIA_RE.search(title):
         return False
     return True
@@ -109,7 +149,6 @@ def _normalize_search_event(raw: dict[str, Any]) -> dict[str, Any] | None:
         "address": address,
         "event_token": raw.get("event_token"),
     }
-    # Optional fields only when present in the source payload.
     if raw.get("type"):
         out["type"] = raw["type"]
     if raw.get("thumbnail"):
@@ -158,7 +197,6 @@ def _normalize_details(raw: dict[str, Any]) -> dict[str, Any]:
     local_map = details.get("local_map") or {}
     if local_map.get("link"):
         out["map_link"] = local_map["link"]
-    # Drop nulls so clients can treat absence as unknown.
     return {k: v for k, v in out.items() if v not in (None, "", [], {})}
 
 
@@ -172,6 +210,116 @@ def _htichips_for(when: str) -> str | None:
     return None
 
 
+def _search_locations(location: str) -> list[str]:
+    """Primary location plus optional parent metro for denser suburb results."""
+    locations = [location]
+    city = location.split(",")[0].strip().lower()
+    metro = METRO_FALLBACKS.get(city)
+    if metro and metro.lower() != location.lower():
+        locations.append(metro)
+    return locations
+
+
+def _query_shapes(location: str) -> list[str]:
+    return [
+        f"bar trivia {location}",
+        f"pub trivia {location}",
+        f"trivia night {location}",
+        f"team trivia {location}",
+    ]
+
+
+def _parse_start_hint(event: dict[str, Any], now: datetime) -> datetime | None:
+    """Best-effort parse of Google Events date labels for server-side pruning."""
+    raw = (event.get("when") or event.get("start_date") or "").strip()
+    if not raw:
+        return None
+    # Keep the start side of ranges.
+    for sep in (" – ", " - ", "—", "–"):
+        if sep in raw:
+            raw = raw.split(sep, 1)[0].strip()
+            break
+    # Drop weekday prefixes: "Thu, Oct 22, 2026, 7:00 PM"
+    if "," in raw and len(raw.split(",")[0]) <= 3:
+        raw = raw.split(",", 1)[1].strip()
+
+    formats = (
+        "%b %d, %Y, %I:%M %p",
+        "%b %d, %Y %I:%M %p",
+        "%b %d, %I:%M %p",
+        "%b %d %I:%M %p",
+        "%b %d, %Y",
+        "%b %d",
+    )
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+        if "%Y" not in fmt:
+            parsed = parsed.replace(year=now.year)
+            # Stale undated rows (Jul/Sep in October) should drop, not roll a year.
+            if parsed < now - timedelta(days=2):
+                bumped = parsed.replace(year=now.year + 1)
+                if bumped - now <= timedelta(days=120):
+                    parsed = bumped
+                else:
+                    return parsed  # keep as past → filtered
+        return parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _is_clearly_past(event: dict[str, Any], now: datetime) -> bool:
+    parsed = _parse_start_hint(event, now)
+    if parsed is None:
+        return False
+    return parsed < now - timedelta(hours=3)
+
+
+def _fetch_query(
+    *,
+    q: str,
+    chip: str | None,
+    key: str,
+    attempts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    params: dict[str, str] = {
+        "engine": "google_events",
+        "q": q,
+        "hl": "en",
+        "gl": "us",
+        "api_key": key,
+    }
+    if chip:
+        params["htichips"] = chip
+
+    try:
+        payload = _http_get(params)
+    except Exception as exc:  # noqa: BLE001
+        attempts.append({"q": q, "error": str(exc)})
+        return []
+
+    if payload.get("error"):
+        attempts.append({"q": q, "error": payload["error"]})
+        if not chip:
+            return []
+        # Retry once without the date chip — Google often blanks chip filters.
+        params.pop("htichips", None)
+        try:
+            payload = _http_get(params)
+        except Exception as exc:  # noqa: BLE001
+            attempts.append({"q": q, "retry_error": str(exc)})
+            return []
+        if payload.get("error"):
+            attempts.append({"q": q, "retry_error": payload["error"]})
+            return []
+
+    raw_events = payload.get("events_results") or []
+    normalized = [n for n in (_normalize_search_event(e) for e in raw_events) if n]
+    attempts.append({"q": q, "raw": len(raw_events), "trivia": len(normalized)})
+    return normalized
+
+
 def search_events(location: str, when: str = "week") -> dict[str, Any]:
     """Run Google Events via SerpApi using query shapes that work for pub trivia."""
     location = location.strip()
@@ -179,60 +327,20 @@ def search_events(location: str, when: str = "week") -> dict[str, Any]:
         raise ValueError("location is required")
 
     key = _api_key()
-    # Empirically, putting the city in `q` works for Columbus trivia;
-    # `location=` + short `q=trivia night` often returns empty.
-    queries = [
-        f"bar trivia {location}",
-        f"trivia night {location}",
-        f"pub trivia {location}",
-    ]
     chip = _htichips_for(when)
     collected: list[dict[str, Any]] = []
-    used_query = None
+    used_queries: list[str] = []
     attempts: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
 
-    for q in queries:
-        params: dict[str, str] = {
-            "engine": "google_events",
-            "q": q,
-            "hl": "en",
-            "gl": "us",
-            "api_key": key,
-        }
-        if chip:
-            params["htichips"] = chip
-        try:
-            payload = _http_get(params)
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            attempts.append({"q": q, "error": f"HTTP {exc.code}", "body": body[:240]})
-            continue
-        except Exception as exc:  # noqa: BLE001
-            attempts.append({"q": q, "error": str(exc)})
-            continue
-
-        if payload.get("error"):
-            attempts.append({"q": q, "error": payload["error"]})
-            # Retry same query without date chip once.
-            if chip:
-                params.pop("htichips", None)
-                try:
-                    payload = _http_get(params)
-                except Exception as exc:  # noqa: BLE001
-                    attempts.append({"q": q, "retry_error": str(exc)})
-                    continue
-                if payload.get("error"):
-                    attempts.append({"q": q, "retry_error": payload["error"]})
-                    continue
-            else:
-                continue
-
-        raw_events = payload.get("events_results") or []
-        normalized = [n for n in (_normalize_search_event(e) for e in raw_events) if n]
-        attempts.append({"q": q, "raw": len(raw_events), "trivia": len(normalized)})
-        if normalized:
-            collected = normalized
-            used_query = q
+    for loc in _search_locations(location):
+        for q in _query_shapes(loc):
+            batch = _fetch_query(q=q, chip=chip, key=key, attempts=attempts)
+            if batch:
+                used_queries.append(q)
+                collected.extend(batch)
+        # Enough density from the primary location — still allow metro merge below.
+        if loc == location and len(collected) >= 12:
             break
 
     # De-dupe by occurrence id while preserving order.
@@ -242,13 +350,16 @@ def search_events(location: str, when: str = "week") -> dict[str, Any]:
         if event["id"] in seen:
             continue
         seen.add(event["id"])
+        # Drop obviously stale Google rows (Jul/Sep leftovers in October).
+        if _is_clearly_past(event, now):
+            continue
         unique.append(event)
 
     return {
         "source": "serpapi_google_events",
         "location": location,
         "when": when,
-        "query_used": used_query,
+        "query_used": " | ".join(used_queries[:4]) if used_queries else None,
         "count": len(unique),
         "events": unique,
         "attempts": attempts,
