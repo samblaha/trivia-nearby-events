@@ -528,7 +528,10 @@ class Handler(BaseHTTPRequestHandler):
   <main>
     <h1>Privacy overview</h1>
     <p>Trivia Nearby uses your location only to find nearby trivia nights. Precise coordinates are not sent to the listings proxy; the app sends a place label (city or ZIP text).</p>
-    <p>Saved nights, invites, preferences, and the last live search results are stored on your device. MapKit may make its own network requests for maps, search, and directions.</p>
+    <p>Browsing does not require an account. Supabase stores your email, account identifier, player profile, and saved nights when you create an account. Saved nights remain private. You can delete your account in Profile.</p>
+    <p>Shared teams store team names, membership, planned nights, and RSVPs in Supabase. Teammates can see player display names and team responses, but not account emails or private saved nights. Anyone with an invitation link can preview the team name and member count; an account is required to join. The captain can replace invitation links and remove members. Leaving removes your membership and team RSVPs. Deleting the captain’s account deletes their teams.</p>
+    <p>AI team-name suggestions run on your device using Apple Intelligence. Your inspiration text is not sent to our server. A name you choose is stored in Supabase when you create a shared team.</p>
+    <p>A local copy of saved nights, invites, preferences, and the last live search results is stored on your device. MapKit may make its own network requests for maps, search, and directions.</p>
     <p>Listings are sourced from Google Events via a server proxy. We do not sell personal data.</p>
   </main>
 </body>
