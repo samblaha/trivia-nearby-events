@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY events_api.py .
+COPY events_api.py invite_landing.py .
 
 ENV EVENTS_API_HOST=0.0.0.0
 # Render sets PORT at runtime (often 10000).

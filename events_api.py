@@ -512,21 +512,8 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _invite_html() -> str:
-        return """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Open in Trivia Nearby</title>
-</head>
-<body>
-  <main>
-    <h1>Trivia Nearby</h1>
-    <p>Open this invite in the Trivia Nearby app.</p>
-  </main>
-</body>
-</html>
-"""
+        from invite_landing import INVITE_HTML
+        return INVITE_HTML
 
     @staticmethod
     def _privacy_html() -> str:
