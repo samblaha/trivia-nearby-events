@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -39,6 +40,26 @@ NON_TRIVIA_HINTS = re.compile(
 
 # Suburb / neighborhood searches often return stale Google Events rows.
 # Always also query the parent metro so the feed stays dense.
+SEARCH_CACHE_TTL_SEC = int(os.environ.get("EVENTS_SEARCH_CACHE_TTL_SEC", "600"))
+DEFAULT_WARM_LOCATION = os.environ.get("EVENTS_WARM_LOCATION", "Columbus, OH")
+DEFAULT_WARM_WHEN = os.environ.get("EVENTS_WARM_WHEN", "week")
+EARLY_EXIT_MIN_EVENTS = int(os.environ.get("EVENTS_EARLY_EXIT_MIN", "8"))
+
+_search_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_cache_lock = threading.Lock()
+
+APPLE_APP_SITE_ASSOCIATION: dict[str, Any] = {
+    "applinks": {
+        "apps": [],
+        "details": [
+            {
+                "appID": "QWC625J4YU.com.trivianearby.app",
+                "paths": ["/invite", "/invite/*"],
+            }
+        ],
+    }
+}
+
 METRO_FALLBACKS: dict[str, str] = {
     "westerville": "Columbus, OH",
     "dublin": "Columbus, OH",
@@ -223,10 +244,45 @@ def _search_locations(location: str) -> list[str]:
 def _query_shapes(location: str) -> list[str]:
     return [
         f"bar trivia {location}",
-        f"pub trivia {location}",
         f"trivia night {location}",
-        f"team trivia {location}",
     ]
+
+
+def _normalize_location_key(location: str) -> str:
+    return " ".join(location.strip().lower().split())
+
+
+def _search_cache_get(location: str, when: str) -> dict[str, Any] | None:
+    key = (_normalize_location_key(location), when.lower())
+    now = time.monotonic()
+    with _cache_lock:
+        entry = _search_cache.get(key)
+        if not entry:
+            return None
+        expires_at, body = entry
+        if now >= expires_at:
+            _search_cache.pop(key, None)
+            return None
+        return json.loads(json.dumps(body))
+
+
+def _search_cache_set(location: str, when: str, body: dict[str, Any]) -> None:
+    key = (_normalize_location_key(location), when.lower())
+    expires_at = time.monotonic() + SEARCH_CACHE_TTL_SEC
+    with _cache_lock:
+        _search_cache[key] = (expires_at, json.loads(json.dumps(body)))
+
+
+def warm_search_cache(
+    location: str | None = None,
+    when: str | None = None,
+) -> dict[str, Any]:
+    loc = (location or DEFAULT_WARM_LOCATION).strip()
+    w = (when or DEFAULT_WARM_WHEN).lower()
+    if w not in {"tonight", "week", "month", "any"}:
+        w = "week"
+    body = search_events(location=loc, when=w, use_cache=False)
+    return {"ok": True, "warmed": {"location": loc, "when": w, "count": body.get("count", 0)}}
 
 
 def _parse_start_hint(event: dict[str, Any], now: datetime) -> datetime | None:
@@ -324,11 +380,25 @@ def _fetch_query(
     return normalized
 
 
-def search_events(location: str, when: str = "week") -> dict[str, Any]:
+def search_events(
+    location: str,
+    when: str = "week",
+    *,
+    use_cache: bool = True,
+) -> dict[str, Any]:
     """Run Google Events via SerpApi using query shapes that work for pub trivia."""
     location = location.strip()
     if not location:
         raise ValueError("location is required")
+
+    when = when.lower()
+    if when not in {"tonight", "week", "month", "any"}:
+        when = "week"
+
+    if use_cache:
+        cached = _search_cache_get(location, when)
+        if cached is not None:
+            return cached
 
     key = _api_key()
     chip = _htichips_for(when)
@@ -344,7 +414,7 @@ def search_events(location: str, when: str = "week") -> dict[str, Any]:
                 used_queries.append(q)
                 collected.extend(batch)
         # Enough density from the primary location — still allow metro merge below.
-        if loc == location and len(collected) >= 12:
+        if loc == location and len(collected) >= EARLY_EXIT_MIN_EVENTS:
             break
 
     # De-dupe by occurrence id while preserving order.
@@ -359,7 +429,7 @@ def search_events(location: str, when: str = "week") -> dict[str, Any]:
             continue
         unique.append(event)
 
-    return {
+    body = {
         "source": "serpapi_google_events",
         "location": location,
         "when": when,
@@ -368,6 +438,9 @@ def search_events(location: str, when: str = "week") -> dict[str, Any]:
         "events": unique,
         "attempts": attempts,
     }
+    if use_cache:
+        _search_cache_set(location, when, body)
+    return body
 
 
 def event_details(token: str) -> dict[str, Any]:
@@ -398,15 +471,102 @@ class Handler(BaseHTTPRequestHandler):
         sys_stderr = __import__("sys").stderr
         print(f"[events-api] {self.address_string()} {fmt % args}", file=sys_stderr)
 
-    def _send(self, status: int, body: dict[str, Any]) -> None:
+    def _send_json(
+        self,
+        status: int,
+        body: dict[str, Any],
+        *,
+        cache_control: str = "no-store",
+    ) -> None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache_control)
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_html(self, status: int, html: str, *, cache_control: str = "no-store") -> None:
+        data = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", cache_control)
+        self.end_headers()
+        self.wfile.write(data)
+
+    @staticmethod
+    def _aasa_body() -> bytes:
+        return json.dumps(APPLE_APP_SITE_ASSOCIATION, separators=(",", ":")).encode("utf-8")
+
+    def _send_aasa(self) -> None:
+        data = self._aasa_body()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        self.wfile.write(data)
+
+    @staticmethod
+    def _invite_html() -> str:
+        return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Open in Trivia Nearby</title>
+</head>
+<body>
+  <main>
+    <h1>Trivia Nearby</h1>
+    <p>Open this invite in the Trivia Nearby app.</p>
+  </main>
+</body>
+</html>
+"""
+
+    @staticmethod
+    def _privacy_html() -> str:
+        return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trivia Nearby Privacy</title>
+</head>
+<body>
+  <main>
+    <h1>Privacy overview</h1>
+    <p>Trivia Nearby uses your location only to find nearby trivia nights. Precise coordinates are not sent to the listings proxy; the app sends a place label (city or ZIP text).</p>
+    <p>Saved nights, invites, preferences, and the last live search results are stored on your device. MapKit may make its own network requests for maps, search, and directions.</p>
+    <p>Listings are sourced from Google Events via a server proxy. We do not sell personal data.</p>
+  </main>
+</body>
+</html>
+"""
+
+    @staticmethod
+    def _support_html() -> str:
+        return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trivia Nearby Support</title>
+</head>
+<body>
+  <main>
+    <h1>Support</h1>
+    <p>Trivia Nearby helps you find pub trivia near you.</p>
+    <p>If listings look wrong or missing, pull to refresh on Discover, widen your radius, or try a nearby city. Schedules come from Google Events and can change without notice—always confirm with the venue.</p>
+    <p>For app issues, contact the developer through App Store Connect once the app is live.</p>
+  </main>
+</body>
+</html>
+"""
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(204)
@@ -417,30 +577,61 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path not in ("/events", "/health"):
-            self._send(404, {"error": "not_found", "message": "Use GET /events"})
+        path = parsed.path.rstrip("/") or "/"
+        if path in ("/.well-known/apple-app-site-association", "/apple-app-site-association"):
+            self._send_aasa()
             return
-        if parsed.path == "/health":
-            self._send(200, {"ok": True})
+        if path == "/invite" or path.startswith("/invite/"):
+            self._send_html(200, self._invite_html())
+            return
+        if path == "/privacy":
+            self._send_html(200, self._privacy_html(), cache_control="public, max-age=3600")
+            return
+        if path == "/support":
+            self._send_html(200, self._support_html(), cache_control="public, max-age=3600")
+            return
+        if path == "/health":
+            self._send_json(200, {"ok": True})
+            return
+        if path == "/warm":
+            qs = urllib.parse.parse_qs(parsed.query)
+            location = (qs.get("location") or [""])[0] or None
+            when = (qs.get("when") or [""])[0] or None
+            try:
+                self._send_json(200, warm_search_cache(location=location, when=when))
+            except ValueError as exc:
+                self._send_json(400, {"error": "bad_request", "message": str(exc)})
+            except RuntimeError as exc:
+                self._send_json(502, {"error": "upstream", "message": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                self._send_json(500, {"error": "server_error", "message": str(exc)})
+            return
+        if path != "/events":
+            self._send_json(404, {"error": "not_found", "message": "Use GET /events"})
             return
 
         qs = urllib.parse.parse_qs(parsed.query)
         token = (qs.get("token") or [""])[0]
         try:
             if token:
-                self._send(200, event_details(token))
+                self._send_json(200, event_details(token))
                 return
             location = (qs.get("location") or [""])[0]
             when = ((qs.get("when") or ["week"])[0] or "week").lower()
             if when not in {"tonight", "week", "month", "any"}:
                 when = "week"
-            self._send(200, search_events(location=location, when=when))
+            cached = _search_cache_get(location, when)
+            if cached is not None:
+                self._send_json(200, cached, cache_control="private, max-age=60")
+                return
+            body = search_events(location=location, when=when)
+            self._send_json(200, body, cache_control="no-store")
         except ValueError as exc:
-            self._send(400, {"error": "bad_request", "message": str(exc)})
+            self._send_json(400, {"error": "bad_request", "message": str(exc)})
         except RuntimeError as exc:
-            self._send(502, {"error": "upstream", "message": str(exc)})
+            self._send_json(502, {"error": "upstream", "message": str(exc)})
         except Exception as exc:  # noqa: BLE001
-            self._send(500, {"error": "server_error", "message": str(exc)})
+            self._send_json(500, {"error": "server_error", "message": str(exc)})
 
 
 def main() -> None:
