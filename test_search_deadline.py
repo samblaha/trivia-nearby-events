@@ -36,6 +36,32 @@ class SearchDeadlineTests(unittest.TestCase):
                 events_api.search_events('Dublin, OH', use_cache=False)
         self.assertEqual(len(calls), 1)
 
+    def test_successful_empty_search_is_cached_as_zero_results(self):
+        payload = {
+            'search_metadata': {'status': 'Success'},
+            'error': "Google hasn't returned any results for this query.",
+        }
+        events_api._search_cache.clear()
+        with patch('events_api._api_key', return_value='test'), patch('events_api._http_get', return_value=payload) as network:
+            result = events_api.search_events('Empty test city')
+            self.assertEqual(result['count'], 0)
+            self.assertEqual(result['events'], [])
+            self.assertTrue(any('htichips' not in call.args[0] for call in network.call_args_list))
+            network.reset_mock()
+            self.assertEqual(events_api.search_events('Empty test city'), result)
+            network.assert_not_called()
+
+    def test_empty_error_without_success_status_is_not_cached(self):
+        payload = {
+            'search_metadata': {'status': 'Error'},
+            'error': "Google hasn't returned any results for this query.",
+        }
+        events_api._search_cache.clear()
+        with patch('events_api._api_key', return_value='test'), patch('events_api._http_get', return_value=payload):
+            with self.assertRaisesRegex(RuntimeError, 'temporarily unavailable'):
+                events_api.search_events('Failed test city')
+        self.assertIsNone(events_api._search_cache_get('Failed test city', 'week'))
+
 
 if __name__ == '__main__':
     unittest.main()
