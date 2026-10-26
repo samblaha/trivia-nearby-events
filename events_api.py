@@ -350,6 +350,15 @@ def _is_clearly_past(event: dict[str, Any], now: datetime) -> bool:
     return parsed < now_naive - timedelta(hours=3)
 
 
+def _empty_search_result(payload: dict[str, Any]) -> bool:
+    # SerpApi uses an error message even for successful searches with no matches.
+    # https://serpapi.com/api-status-and-error-codes
+    return (
+        payload.get("search_metadata", {}).get("status") == "Success"
+        and payload.get("error") == "Google hasn't returned any results for this query."
+    )
+
+
 def _fetch_query(
     *,
     q: str,
@@ -375,7 +384,10 @@ def _fetch_query(
         return []
 
     if payload.get("error"):
-        attempts.append({"q": q, "error": payload["error"]})
+        if _empty_search_result(payload):
+            attempts.append({"q": q, "raw": 0, "trivia": 0})
+        else:
+            attempts.append({"q": q, "error": payload["error"]})
         if not chip:
             return []
         # Retry once without the date chip — Google often blanks chip filters.
@@ -385,7 +397,7 @@ def _fetch_query(
         except Exception as exc:  # noqa: BLE001
             attempts.append({"q": q, "retry_error": str(exc)})
             return []
-        if payload.get("error"):
+        if payload.get("error") and not _empty_search_result(payload):
             attempts.append({"q": q, "retry_error": payload["error"]})
             return []
 
