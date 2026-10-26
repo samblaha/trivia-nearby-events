@@ -27,7 +27,7 @@ Listens on `http://0.0.0.0:8787` by default (or `PORT` / `EVENTS_API_PORT`).
 
 ## SerpApi cost / cold-start mitigations
 
-- **In-memory search cache:** `(normalized location, when)` → full JSON response, TTL **10 minutes** (`EVENTS_SEARCH_CACHE_TTL_SEC`, default 600). Cache hits skip SerpApi and respond with `Cache-Control: private, max-age=60`.
+- **In-memory search cache:** `(normalized location, when)` → Google JSON response, TTL **10 minutes** (`EVENTS_SEARCH_CACHE_TTL_SEC`, default 600). Cache hits skip SerpApi. Responses use `Cache-Control: no-store` because managed listings are fetched fresh on every search.
 - **Fewer queries:** only `bar trivia {location}` and `trivia night {location}` (two shapes per location; metro fallback unchanged).
 - **Early exit:** stops querying after enough trivia rows on the primary location (default **8**, `EVENTS_EARLY_EXIT_MIN`).
 - **Warm:** `GET /warm` runs one cached search for the default metro; use after deploy or idle spin-up if you want listings ready before user traffic.
@@ -57,3 +57,11 @@ iOS `TriviaNearbyEventsAPIURL` → `https://trivia-nearby-events.onrender.com`
 `SERPAPI_API_KEY` lives only as a Render env var (never in git).
 
 Free Render web services may cold-start after idle; the first request after sleep can take ~30–60s.
+
+## Business website listings
+
+`business_events.py` reads only the public `business_event_feed` Supabase projection with the publishable key; no service-role credential is needed. `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY` can override the existing project defaults. Private owner and billing columns are excluded by the database, as are drafts, paused listings and ended schedules.
+
+Weekly schedules expand into occurrences using the venue timezone, including DST offsets. Every search merges a fresh business feed with Google results so a cached Google response cannot retain paused business events or stale promotional entitlement. Business listings still load when Google raises an upstream error; a business-feed timeout does not prevent Google results. Paid placement remains governed by the database's launch settings.
+
+Run `python3 -m unittest discover -p 'test_*.py'` and `node --test test_invite_landing.mjs`. CI runs these checks on Python 3.12 and Node 24. HTTP tests cover publish/pause changes on cached searches, provider failures, required input and detail-route isolation; schedule tests cover date windows, expiry and DST. Production delivery of an actual owner's published event still requires an end-to-end app check.
