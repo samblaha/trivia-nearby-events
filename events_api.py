@@ -24,6 +24,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from business_events import search_business_events, merge_business_events
 from typing import Any
 
 SERPAPI_SEARCH = "https://serpapi.com/search.json"
@@ -532,7 +533,11 @@ class Handler(BaseHTTPRequestHandler):
     <p>Shared teams store team names, membership, planned nights, and RSVPs in Supabase. Teammates can see player display names and team responses, but not account emails or private saved nights. Anyone with an invitation link can preview the team name and member count; an account is required to join. The captain can replace invitation links and remove members. Leaving removes your membership and team RSVPs. Deleting the captain’s account deletes their teams.</p>
     <p>AI team-name suggestions run on your device using Apple Intelligence. Your inspiration text is not sent to our server. A name you choose is stored in Supabase when you create a shared team.</p>
     <p>A local copy of saved nights, invites, preferences, and the last live search results is stored on your device. MapKit may make its own network requests for maps, search, and directions.</p>
-    <p>Listings are sourced from Google Events via a server proxy. We do not sell personal data.</p>
+    <h2>Business accounts and listings</h2>
+    <p>For venue owners and trivia hosts, Supabase stores your business name, account email, business type, city, signup source, event schedules, and ownership-review submissions. Published event details, including venue addresses, descriptions and booking links, are public. Draft and paused listings are excluded from our public business feed. Other users cannot read your private account or billing records.</p>
+    <p>If you have a business subscription, Stripe processes payment details. We store customer and subscription identifiers, plan, status and paid-through dates; we do not store full payment-card numbers. New paid promotions are currently unavailable.</p>
+    <p>Account emails are delivered through Resend. Support messages, including your email address and message content, are handled in Zoho Mail. Render hosts our websites and API; hosting and email providers may keep operational request or delivery logs. Contact <a href="mailto:support@trivianearby.app">support@trivianearby.app</a> for access, correction or deletion requests. Business account deletion requires reconciling any active billing first.</p>
+    <p>Listings are sourced from Google Events and participating venues or hosts via a server proxy. We do not sell personal data.</p>
   </main>
 </body>
 </html>
@@ -552,7 +557,8 @@ class Handler(BaseHTTPRequestHandler):
     <h1>Support</h1>
     <p>Trivia Nearby helps you find pub trivia near you.</p>
     <p>If listings look wrong or missing, pull to refresh on Discover, widen your radius, or try a nearby city. Schedules come from Google Events and can change without notice—always confirm with the venue.</p>
-    <p>For app issues, contact the developer through App Store Connect once the app is live.</p>
+    <p>For app or account help, email <a href="mailto:support@trivianearby.app">support@trivianearby.app</a>. Include what happened, your device and app version, and the event details when relevant. Do not send passwords or confirmation codes.</p>
+    <p>Venue owners and trivia hosts can find event-management help at <a href="https://trivianearby.app/support">Trivia Nearby for business support</a>.</p>
   </main>
 </body>
 </html>
@@ -607,15 +613,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, event_details(token))
                 return
             location = (qs.get("location") or [""])[0]
+            if not location.strip():
+                raise ValueError("location is required")
             when = ((qs.get("when") or ["week"])[0] or "week").lower()
             if when not in {"tonight", "week", "month", "any"}:
                 when = "week"
+            # Fetch the public business projection on each search, including
+            # Google-cache hits, so pauses and entitlement changes take effect.
+            managed = search_business_events(location, when)
             cached = _search_cache_get(location, when)
             if cached is not None:
-                self._send_json(200, cached, cache_control="private, max-age=60")
+                self._send_json(200, merge_business_events(cached, managed), cache_control="no-store")
                 return
-            body = search_events(location=location, when=when)
-            self._send_json(200, body, cache_control="no-store")
+            try:
+                body = search_events(location=location, when=when)
+            except RuntimeError:
+                if not managed:
+                    raise
+                body = {"source": "business_events", "location": location, "when": when, "events": []}
+            self._send_json(200, merge_business_events(body, managed), cache_control="no-store")
         except ValueError as exc:
             self._send_json(400, {"error": "bad_request", "message": str(exc)})
         except RuntimeError as exc:
