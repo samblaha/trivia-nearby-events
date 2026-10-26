@@ -64,4 +64,6 @@ Free Render web services may cold-start after idle; the first request after slee
 
 Weekly schedules expand into occurrences using the venue timezone, including DST offsets. Every search merges a fresh business feed with Google results so a cached Google response cannot retain paused business events or stale promotional entitlement. Business listings still load when Google raises an upstream error; a business-feed timeout does not prevent Google results. Paid placement remains governed by the database's launch settings.
 
+Google searches share a 20-second deadline across queries and retries, with each network attempt limited to the remaining time (at most 12 seconds). This prevents a slow Google response from holding managed listings behind repeated 45-second waits. Complete provider failure is returned as an error when there are no managed results, and is never cached as an empty successful search.
+
 Run `python3 -m unittest discover -p 'test_*.py'` and `node --test test_invite_landing.mjs`. CI runs these checks on Python 3.12 and Node 24. HTTP tests cover publish/pause changes on cached searches, provider failures, required input and detail-route isolation; schedule tests cover date windows, expiry and DST. Production delivery of an actual owner's published event still requires an end-to-end app check.

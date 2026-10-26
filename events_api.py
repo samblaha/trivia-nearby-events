@@ -45,6 +45,7 @@ SEARCH_CACHE_TTL_SEC = int(os.environ.get("EVENTS_SEARCH_CACHE_TTL_SEC", "600"))
 DEFAULT_WARM_LOCATION = os.environ.get("EVENTS_WARM_LOCATION", "Columbus, OH")
 DEFAULT_WARM_WHEN = os.environ.get("EVENTS_WARM_WHEN", "week")
 EARLY_EXIT_MIN_EVENTS = int(os.environ.get("EVENTS_EARLY_EXIT_MIN", "8"))
+SEARCH_DEADLINE_SEC = 20
 
 _search_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _cache_lock = threading.Lock()
@@ -88,30 +89,42 @@ def _api_key() -> str:
     return key
 
 
-def _http_get(params: dict[str, str], *, retries: int = 2) -> dict[str, Any]:
+def _retry_pause(attempt: int, deadline: float | None) -> None:
+    delay = 0.6 * (attempt + 1)
+    if deadline is not None:
+        delay = min(delay, max(0, deadline - time.monotonic()))
+    time.sleep(delay)
+
+
+def _http_get(
+    params: dict[str, str], *, retries: int = 2, deadline: float | None = None
+) -> dict[str, Any]:
     query = urllib.parse.urlencode(params)
     url = f"{SERPAPI_SEARCH}?{query}"
     last_error: Exception | None = None
     for attempt in range(retries + 1):
+        remaining = deadline - time.monotonic() if deadline is not None else 45
+        if remaining <= 0:
+            raise TimeoutError("Event search deadline exceeded")
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "TriviaNearbyEventsAPI/1.1"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with urllib.request.urlopen(req, timeout=min(12, remaining) if deadline is not None else 45) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             # Retry rate limits / transient upstream failures.
             if exc.code in {429, 500, 502, 503, 504} and attempt < retries:
-                time.sleep(0.6 * (attempt + 1))
+                _retry_pause(attempt, deadline)
                 last_error = RuntimeError(f"HTTP {exc.code}: {body[:240]}")
                 continue
             raise RuntimeError(f"HTTP {exc.code}: {body[:240]}") from exc
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             if attempt < retries:
-                time.sleep(0.6 * (attempt + 1))
+                _retry_pause(attempt, deadline)
                 continue
             raise
     raise RuntimeError(str(last_error) if last_error else "request failed")
@@ -343,6 +356,7 @@ def _fetch_query(
     chip: str | None,
     key: str,
     attempts: list[dict[str, Any]],
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     params: dict[str, str] = {
         "engine": "google_events",
@@ -355,7 +369,7 @@ def _fetch_query(
         params["htichips"] = chip
 
     try:
-        payload = _http_get(params)
+        payload = _http_get(params, deadline=deadline)
     except Exception as exc:  # noqa: BLE001
         attempts.append({"q": q, "error": str(exc)})
         return []
@@ -367,7 +381,7 @@ def _fetch_query(
         # Retry once without the date chip — Google often blanks chip filters.
         params.pop("htichips", None)
         try:
-            payload = _http_get(params)
+            payload = _http_get(params, deadline=deadline)
         except Exception as exc:  # noqa: BLE001
             attempts.append({"q": q, "retry_error": str(exc)})
             return []
@@ -407,15 +421,18 @@ def search_events(
     used_queries: list[str] = []
     attempts: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc)
+    deadline = time.monotonic() + SEARCH_DEADLINE_SEC
 
     for loc in _search_locations(location):
         for q in _query_shapes(loc):
-            batch = _fetch_query(q=q, chip=chip, key=key, attempts=attempts)
+            if time.monotonic() >= deadline:
+                break
+            batch = _fetch_query(q=q, chip=chip, key=key, attempts=attempts, deadline=deadline)
             if batch:
                 used_queries.append(q)
                 collected.extend(batch)
         # Enough density from the primary location — still allow metro merge below.
-        if loc == location and len(collected) >= EARLY_EXIT_MIN_EVENTS:
+        if time.monotonic() >= deadline or (loc == location and len(collected) >= EARLY_EXIT_MIN_EVENTS):
             break
 
     # De-dupe by occurrence id while preserving order.
@@ -429,6 +446,9 @@ def search_events(
         if _is_clearly_past(event, now):
             continue
         unique.append(event)
+
+    if not unique and attempts and all('error' in attempt or 'retry_error' in attempt for attempt in attempts):
+        raise RuntimeError("Event search is temporarily unavailable. Please try again.")
 
     body = {
         "source": "serpapi_google_events",
